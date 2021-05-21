@@ -1,0 +1,1321 @@
+// Calendário
+/*Estipula o mês e ano final de acodo com a data do sistema*/
+%LET mesFim = %SYSFUNC(MONTH("&SYSDATE"d));
+%LET anoFim = %SYSFUNC(YEAR("&SYSDATE"d));
+/*Looping para a criação da data no período de 3 anos anterior ao do sistema*/
+data calendario_data(keep=data Mes Ano);
+   do data = INTNX('YEAR', MDY(&mesFim., 1, &anoFim.), -3) to "&SYSDATE"d;
+      Mes = MONTH(data);
+      Ano = YEAR(data);
+      output;
+	  data = intnx("month",data,1);
+   end;
+   format data DDMMYY8.;
+run;
+/*Tabela criada para que todos as datas se iniciacem no dia 1*/ 
+PROC SQL;
+   CREATE TABLE WORK.CALENDARIO AS 
+   SELECT
+          MDY(Mes,1,Ano)  format ddmmyy10. as Data, 
+          t1.Mes, 
+          t1.Ano
+      FROM WORK.CALENDARIO_data t1;
+QUIT;
+
+PROC SQL;
+DROP TABLE WORK.calendario_data;
+QUIT;
+
+//Agentes
+
+/*Utilizada como uma tabela dimensão para auxiliar na tabela de criação do Rankig*/
+PROC SQL;
+CREATE TABLE Agentes as
+SELECT DISTINCT t1.IdAgente,
+	   t1.SiglaAgente,
+	   t4.Grupo,
+	   t4.Personificacao,
+	   t4.Agencia,
+       t3.N AS UC,	
+	   t1.Classificacao, 	
+	   t2.Data AS DataPainel, 
+       t2.Mes, 
+       t2.Ano
+FROM calendario t2 
+CROSS JOIN INDDISTR.DISTRIBUIDORAS t1 
+LEFT JOIN INDDISTR.INDCONTDECFECMVLDIST t3  ON (t1.IdAgente = t3.IdAgente) AND INTNX('MONTH',t2.Data, -2) = MDY(t3.Mes,1,t3.Ano)
+LEFT JOIN SFEMONIT.LISTA_DISTRIBUIDORAS t4 ON (t1.IdAgente = t4.IdAgente)
+/*Pega soamente as concessionarias e limpa as não tem mais concessão*/
+WHERE t1.Classificacao IN ('Concessionária') 
+AND t1.IdAgente NOT IN 
+           (
+           	28,
+		   	70,
+			71,
+			72,
+			73,
+			75,
+			84,
+			386,
+			397,
+			5217
+           );
+RUN;
+
+
+
+\\CTA
+/* Tabela crada com o objetivo de alterar as tipologias e auxiliar no agrupamento da mesma */
+PROC SQL;
+CREATE TABLE SMA01_REN414_3F_03_DIST_Alterada AS
+SELECT    t1.IdeAgt AS IdAgente, 
+          t1.Sigla, 
+		  t2.Classificacao,
+		  t1.DataRef AS DataRef_QR,
+          t1.AnoPrd AS Ano, 
+          t1.MesPrd AS Mes,
+          t1.CodTipRca, 
+          t1.DescTipRca,
+		  /*Indicador utilizado para os calculos*/
+		  /*Como os dados de UCs utilizados pela SMA não são os do INDQUAL, refizemos o cálculo do QR*/
+		  (t1.QtdeCta/t3.N)*10000 AS QRCTA,
+		  t3.N AS UC,
+		  t1.QtdeCta, 
+		  /*Renomeia a tipologias que apresentam o mesmo assunto*/
+		   CASE 
+			    WHEN  t1.CodTipRca = 3  THEN 'Ressarcimento de Danos Elétricos'
+		  	    WHEN  t1.CodTipRca = 22 OR t1.CodTipRca BETWEEN 4 and 9   THEN 'Faturamento'
+				WHEN  t1.CodTipRca = 10  THEN 'Cobranças por Irregularidade'
+                WHEN  t1.CodTipRca BETWEEN 13 and 14 THEN 'Atendimento'
+				WHEN  t1.CodTipRca = 15 THEN 'Alteração Cadastral'
+				/*Tabela 3F não tem essa tipologia - WHEN  t1.CodTipRca = 24 THEN 'Geração Distribuída'*/
+				WHEN  t1.CodTipRca = 2  THEN 'Tensão de Fornecimento'
+				WHEN  t1.CodTipRca = 11 THEN 'Prazos'
+				WHEN  t1.CodTipRca = 12 THEN 'Suspensão Indevida'
+				WHEN  t1.CodTipRca = 17 THEN 'Outros'
+           END AS Assunto, /*Tema utilizado no ranking*/
+          t1.DataProc
+ FROM SMA_SAS.SMA01_REN414_3F_03_DIST t1
+ 					/*Agrupamento com a tabela de agente para separar concessinária e permissionária */
+ 		RIGHT JOIN Agentes t2 ON (t1.IdeAgt = t2.IdAgente)
+				    /*Junção para pegar o número de UCs*/
+		LEFT JOIN INDDISTR.INDCONTDECFECMVLDIST t3  ON (t1.IdeAgt = t3.IdAgente) AND (MONTH(t1.DataRef) = T3.Mes) AND (YEAR(t1.DataRef) = T3.Ano)
+ 					/*Filtas as concessionarias e retira as tipologias que não serão utilizadas;*/
+ WHERE  t1.NumeroConsumidores IS NOT missing AND t1.NumeroConsumidores > 0 
+ 					/*tipologias que não serão utilizadas:1-Reclmações de interrupção de fornecimento e 17-outros*/
+        AND t1.CodTipRca > 1 AND t1.CodTipRca <> 17 
+ 					/*Filtras as concessionárias */
+		AND	t2.Classificacao IN ('Concessionária') 
+	   ORDER BY t1.IdeAgt ASC, t1.CodTipRca ASC, DataRef ASC;
+QUIT;
+
+					/* Tabela realiza a soma QR e agrupa por assunto de cada empresa */
+PROC SQL;
+CREATE TABLE Agupamento_Assunto_CTA AS
+SELECT DISTINCT
+		  t1.IdAgente,
+          t1.Sigla,
+		  t1.DataRef_QR,
+          /*t1.Ano,
+          t1.Mes,*/
+		  			/*Os dados tem uma defasagem de 3 meses, essa função soma os 3 meses para gerar o período atual*/
+		  INTNX('MONTH',DataRef_QR, 3) format ddmmyy10. as DataPainel,
+		  t1.Assunto,
+		  t1.UC,
+		  			/*Soma os QR por assunto e empresas com o mesmo IdAgente, Assunto e DataRef*/
+		  SUM(QRCTA) AS QR_Agrupado 
+      FROM SMA01_REN414_3F_03_DIST_Alterada t1
+	  				/*Filtra os assuntos que não serão utilizados */
+	  WHERE Assunto IS NOT missing /*AND t1.DataRef = INTNX('MONTH', MDY(&mesFim., 1, &AnoFim.), -3)*/ 
+	  GROUP BY t1.IdAgente, t1.Assunto, t1.DataRef_QR
+	  ORDER BY t1.DataRef_QR ASC;
+QUIT;
+       	/* Tabela realiza final CTA */
+PROC SQL;
+   CREATE TABLE WORK.CTA AS 
+   SELECT DISTINCT t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QR, 
+          t1.DataPainel, 
+          t2.Ano, 
+          t2.Mes, 
+          t1.Assunto, 
+          t1.UC, 
+          t1.QR_Agrupado
+      FROM WORK.AGUPAMENTO_ASSUNTO_CTA t1
+           INNER JOIN WORK.CALENDARIO t2 ON (t2.Data = t1.DataPainel)
+			ORDER BY t1.Assunto ASC, t1.DataRef_QR ASC;
+QUIT;
+
+PROC SQL;
+DROP TABLE WORK.SMA01_REN414_3F_03_DIST_Alterada, Agupamento_Assunto_CTA ;
+QUIT;
+
+SGO
+			/* Tabela crada com o objetivo de alterar as tipologias e auxiliar no agrupamento da mesma */
+PROC SQL;
+CREATE TABLE SMA_SGO_REN414_03_Alterada AS
+SELECT    t1.IdAgente,
+          t1.Sigla,
+		  t1.DataRef AS DataRef_QRT,
+		  t1.Ano, 
+		  t1.Mes, 		  
+		  t1.CodTipRca,
+		  t1.DescTipRca, 
+		  (t1.QtdeSgo/t2.UC)*10000 AS QRTSGO,
+		  t2.UC AS UC,
+		  t1.QtdeSgo,
+						  /*Renomeia a tipologias que apresentam o mesmo assunto*/
+		   CASE 
+			    WHEN  t1.CodTipRca = 3  THEN 'Ressarcimento de Danos Elétricos'
+		  	    WHEN  t1.CodTipRca = 22 OR t1.CodTipRca BETWEEN 4 and 9   THEN 'Faturamento'
+				WHEN  t1.CodTipRca = 10  THEN 'Cobranças por Irregularidade'
+                WHEN  t1.CodTipRca BETWEEN 13 and 14 THEN 'Atendimento'
+				WHEN  t1.CodTipRca = 15 THEN 'Alteração Cadastral'
+				WHEN  t1.CodTipRca = 24 THEN 'Geração Distribuída'
+				WHEN  t1.CodTipRca = 2  THEN 'Tensão de Fornecimento'
+				WHEN  t1.CodTipRca = 11 THEN 'Prazos'
+				WHEN  t1.CodTipRca = 12 THEN 'Suspensão Indevida'
+				WHEN  t1.CodTipRca = 17 THEN 'Outros'
+           END AS Assunto,
+		   t1.DataProc
+ FROM SMA_SAS.SMA_SGO_REN414_03 t1
+ 			    /*Junção para pegar o número de UCs*/
+		LEFT JOIN WORK.AGENTES t2  ON (t1.IdAgente = t2.IdAgente) AND (t1.Mes = T2.Mes) AND (t1.Ano = T2.Ano)
+ 						/*Filtas as concessionarias e retira as tipologias que não serão utilizadas;*/
+ WHERE t1.UC IS NOT missing AND t1.UC > 0 AND
+						/*tipologias que não serão utilizadas:1-Reclmações de interrupção de fornecimento e 17-outros*/ 
+ 	   t1.CodTipRca > 1 AND t1.CodTipRca <> 17 
+	   ORDER BY t1.IdAgente ASC, t1.CodTipRca ASC, DataRef ASC;
+QUIT;
+
+						/* Tabela realiza a soma QRT e agrupa por assunto de cada empresa */
+PROC SQL;
+CREATE TABLE Agupamento_Assunto_SGO AS
+SELECT DISTINCT
+		  t1.IdAgente,
+          t1.Sigla,
+		  t1.DataRef_QRT,
+          t1.Ano,
+          t1.Mes,
+		  				/*Os dados tem uma defasagem de 1 mês, essa função soma um mês para gerar o período atual*/
+		  INTNX('MONTH',DataRef_QRT,1) format ddmmyy10. as DataPainel, 
+		  t1.Assunto,
+		  t1.UC,
+		  				/*Soma os QRT por assunto e empresas com o mesmo IdAgente, Assunto e DataRef*/
+		  SUM(t1.QRTSGO) AS QRT_Agrupado 
+ FROM SMA_SGO_REN414_03_Alterada t1
+/* WHERE t1.DataRef = INTNX('MONTH', MDY(&mesFim., 1, &AnoFim.), -1) */
+	  GROUP BY t1.IdAgente, t1.Assunto, t1.DataRef_QRT
+	  ORDER BY t1.DataRef_QRT ASC;
+QUIT;
+
+SGO
+
+PROC SQL;
+CREATE TABLE SGO AS
+SELECT    t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QRT, 
+          t1.DataPainel, 
+		  t2.Ano,
+          t2.Mes,
+          t1.Assunto, 
+          t1.UC, 
+          t1.QRT_Agrupado
+      FROM WORK.AGUPAMENTO_ASSUNTO_SGO t1
+           INNER JOIN WORK.CALENDARIO t2 ON (t2.Data = t1.DataPainel)
+	  ORDER BY t1.Assunto ASC, t1.DataRef_QRT ASC;;
+QUIT;
+
+
+PROC SQL;
+DROP TABLE SMA_SGO_REN414_03_Alterada, Agupamento_Assunto_SGO;
+QUIT;
+
+					/* BUSCA OS DADOS DA BIIBLIOTECA DA IndQual*/
+libname INDDISTR "/opt/sas/sasdata/Aneel/Sistemas ANEEL/IndQual";
+					/*Tabela calcula o QPC por conjunto*/
+PROC SQL;
+   CREATE TABLE WORK.COM_QPC_CONJ AS 
+   SELECT DISTINCT t1.IdAgente, 
+          t1.SiglaPJ, 
+          t1.IdeCnjUndCnm, 
+          t1.Regiao, 
+          t1.TipoAgente, 
+          t1.DscCnjUndCnm, 
+		  			/*Função para inserir a coluna data*/
+		  MDY(Mes,1,Ano)  format ddmmyy10. as Data, 
+          t1.Ano , 
+          t1.Mes , 
+          t1.N, 
+          t1.DEC, 
+          t1.FEC, 
+          t2.DECLimiteAnual, 
+          t2.FECLimiteAnual,
+		  				/* QPC_DEC_CONJ */
+            (IFN(t1.DEC>t2.DECLimiteAnual, t1.DEC/t2.DECLimiteAnual*t1.N, 0)) AS QPC_DEC_CONJ, 
+			          /* QPC_FEC_CONJ */
+            (IFN(t1.FEC>t2.FECLimiteAnual, t1.FEC/t2.FECLimiteAnual*t1.N, 0)) AS QPC_FEC_CONJ
+      FROM INDDISTR.INDCONTDECFECMVLCONJ t1, INDDISTR.INDCONTINUIDADECONJANUAL t2
+      WHERE (t1.IdAgente = t2.IdAgente AND t1.Ano = t2.PrdCptAnoInd AND t1.IdeCnjUndCnm = t2.IdeCnjUndCnm);
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.COM_QPC_DIST AS 
+   SELECT DISTINCT t1.IdAgente, 
+          t1.SiglaPJ, 
+          t1.TipoAgente, 
+		  t1.Data,
+          t1.Ano, 
+          t1.Mes,
+		  	/*Os dados tem uma defasagem de 2 meses, essa função soma os 2 meses para gerar o período atual*/
+		  INTNX('MONTH',Data, 2) format ddmmyy10. as DataPainel, 
+          				/*Soma  a unidade consumidoras */
+           (SUM(t1.N)) AS N, 
+          t2.DECApuradoAnual, 
+          t2.FECLimiteAnual, 
+          t2.FECApuradoAnual, 
+          t2.DECLimiteAnual, 
+          /* QPC_DEC */
+            (SUM(t1.QPC_DEC_CONJ)) AS QPC_DEC, 
+          /* QPC_FEC */
+            (SUM(t1.QPC_FEC_CONJ)) AS QPC_FEC, 
+          /* QPC */
+            (((SUM(t1.QPC_DEC_CONJ))+(SUM(t1.QPC_FEC_CONJ)))/1000) AS QPC,  
+          /* QPC_relativo_RaizN */
+            ((((SUM(t1.QPC_DEC_CONJ))+(SUM(t1.QPC_FEC_CONJ)))/1000)/(SUM(t1.N)**(0.6))*1000) AS QPC_relativo_RaizN
+      FROM WORK.COM_QPC_CONJ t1, INDDISTR.INDCONTINUIDADECONCANUAL t2
+      WHERE /*Data = INTNX('MONTH', MDY(&mesFim., 1, &AnoFim.), -2) AND*/
+			(t1.IdAgente = t2.IdAgente AND t1.Ano = t2.PrdCptAnoInd) AND t1.TipoAgente = 'C'
+
+      GROUP BY t1.IdAgente, 
+			   t1.SiglaPJ, 
+			   t1.TipoAgente,
+               t1.Ano,
+               t1.Mes,
+               t2.DECApuradoAnual,
+               t2.FECLimiteAnual,
+               t2.FECApuradoAnual,
+               t2.DECLimiteAnual
+      ORDER BY t1.IdAgente ASC, t1.Data ASC;
+QUIT;
+
+
+ PROC SQL;
+   CREATE TABLE WORK.CONTINUIDADE_QPC AS 
+   SELECT t1.IdAgente, 
+          t1.SiglaPJ, 
+          t1.TipoAgente, 
+          t1.Data AS DataRef_Cont, 
+          t1.DataPainel,
+		  t2.Ano, 
+          t2.Mes,
+          t1.N, 
+          t1.DECApuradoAnual, 
+          t1.FECLimiteAnual, 
+          t1.FECApuradoAnual, 
+          t1.DECLimiteAnual, 
+          t1.QPC_DEC, 
+          t1.QPC_FEC, 
+          t1.QPC, 
+          t1.QPC_relativo_RaizN
+      FROM WORK.COM_QPC_DIST t1
+           INNER JOIN WORK.CALENDARIO t2 ON (t2.Data = t1.DataPainel)
+		   ORDER BY t1.Data ASC;
+QUIT;
+
+
+PROC SQL;
+DROP TABLE WORK.COM_QPC_CONJ, WORK.COM_QPC_DIST;
+QUIT;
+/*Biblioteca do Indicadores de qualidade*/
+libname INDDISTR "/opt/sas/sasdata/Aneel/Sistemas ANEEL/IndQual";
+
+PROC SQL;
+	/*Cria tabela com para os indicadores de Serviço */
+   CREATE TABLE WORK.INDQUALCOMMVLDIST_FILTRADA AS 
+   SELECT t1.SiglaAgente, 
+          t1.IdAgente,
+		  /*Foi realizado um LEFT JOIN para classificar a tabela como distrbuidora*/
+		  t2.Classificacao, 
+          t1.FimDaReferencia ,
+		  t1.FimDaReferencia format MONTH. as Mes,
+		  t1.FimDaReferencia format YEAR. as Ano,
+		  t1.QtdeServCom, 
+          t1.QuantServComPrazo, 
+          t1.MdaMvl_QtdeServCom, 
+          t1.MdaMvl_QuantServComPrazo, 
+          t1.IdGrupoServ
+	FROM INDDISTR.INDQUALCOMMVLDIST t1
+		           /*Agrupamento com a tabela de agente para separar concessinária e permissionária */
+       			RIGHT JOIN Agentes t2 ON (t1.IdAgente = t2.IdAgente)
+      WHERE t2.Classificacao = 'Concessionária' AND t1.IdGrupoServ = 'Pedidos de ligação nova com obra' OR t2.Classificacao = 'Concessionária' AND t1.IdGrupoServ = 'Pedidos de ligação nova sem obra' 
+      OR t1.IdGrupoServ = 'Religação' AND t2.Classificacao = 'Concessionária';
+QUIT;
+
+PROC SQL;
+/*Nessa tabela acontece a soma dos indicadores e agupamento de acordo com o grupo de serviço*/
+   CREATE TABLE WORK.'Agrupamento_serviços_Comerciais'n AS 
+   SELECT DISTINCT  t1.SiglaAgente, 
+          			t1.IdAgente,
+					t1.Classificacao, 
+          			t1.FimDaReferencia,
+						/*Os dados tem uma defasagem de 3 meses, essa função soma os 3 meses para gerar o período atual*/
+					INTNX('MONTH',FimDaReferencia, 3) format ddmmyy10. as DataPainel, 
+		  			/*t1.FimDaReferencia format MONTH. as Mes,
+		  			t1.FimDaReferencia format YEAR. as Ano,*/
+  					/*SUM Serviços comerciais*/ 
+					SUM(QtdeServCom) as QtdeServCom,
+					/*SUM Serviços comerciais no prazo*/
+					SUM(QuantServComPrazo) as QuantServComPrazo, 
+                    /*SUM Serviços comerciais no violados*/
+                    SUM(QtdeServCom) - SUM(QuantServComPrazo) As QuantViolServCom,
+					/*Percentual de Serviço com Prazo*/
+                    SUM(QuantServComPrazo)/SUM(QtdeServCom)*100 AS Perc_Serv_Com_Prazo,
+         			t1.IdGrupoServ
+      FROM WORK.INDQUALCOMMVLDIST_FILTRADA t1
+	  /*Empresas retiradas pois forma adquirdas ou mudarm a concessão para outras empresas*/
+	  GROUP BY t1.IdAgente, 
+               t1.FimDaReferencia, 
+               t1.IdGrupoServ
+      ORDER BY t1.FimDaReferencia asc, 	t1.IdGrupoServ asc; 
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'SERVIÇOS_COMERCIAIS'n AS 
+   SELECT t1.SiglaAgente, 
+          t1.IdAgente, 
+          t1.Classificacao, 
+          t1.FimDaReferencia AS DataRef_Ser_Com, 
+          t1.DataPainel,
+          t2.Mes,
+		  t2.Ano, 
+          t1.QtdeServCom, 
+          t1.QuantServComPrazo, 
+          t1.QuantViolServCom, 
+          t1.Perc_Serv_Com_Prazo,
+          t1.IdGrupoServ
+      FROM WORK.'AGRUPAMENTO_SERVIÇOS_COMERCIAIS'n t1
+ 				INNER JOIN WORK.CALENDARIO t2 ON (t2.Data = t1.DataPainel);;
+QUIT;
+
+PROC SQL;
+DROP TABLE INDQUALCOMMVLDIST_FILTRADA, WORK.'Agrupamento_serviços_Comerciais'n;
+QUIT;
+
+
+
+libname SFEMONIT "/opt/sas/sasdata/Aneel/SFE/Publico/MONITORAMENTO";
+
+PROC SQL;
+   CREATE TABLE WORK.ESTOQUE_DE_LIGAÇÕES_ATRASADAS AS 
+   SELECT DISTINCT t1.IdAgente,
+          t2.SiglaAgente,  
+          t1.Ano, 
+          t1.QtdNaoIniciada, 
+          t1.QtdEmAndamento, 
+          t1.QtdAtrasada, 
+          t1.QtdTotal, 
+		  (t1.QtdNaoIniciada/t1.QtdTotal)*100 AS PERNAOINICIADA,  
+          (t1.QtdEmAndamento/ t1.QtdTotal)*100 AS PERANDAMENTO,
+		  (t1.QtdAtrasada/t1.QtdTotal)*100 AS PERATRASADA,
+		  t2.Classificacao 
+		  FROM SFEMONIT.LIGACOESATRASADAS t1
+          	/*Agrupamento com a tabela de agente para separar concessinária e permissionária */
+ 				RIGHT JOIN Agentes t2 ON (t1.IdAgente = t2.IdAgente);
+QUIT;
+
+LIBNAME SMA_SAS ODBC  DATASRC=SMA_SAS  SCHEMA=dbo  AUTHDOMAIN="SQLAuth";
+
+%LET mesFim = %SYSFUNC(MONTH("&SYSDATE"d));
+%LET anoFim = %SYSFUNC(YEAR("&SYSDATE"d));
+
+%macro agendaJM();
+proc sql;
+
+  create table WORK.QA
+  (
+   IdAgente num format=11. informat=11. label='IdAgente',
+   Ano num,
+   Mes num,
+   QA num
+  );
+
+PROC SORT Data=SMA_SAS.dw_SMA_Solicitacoes_01 out=SMA_Solicitacoes_sorted;
+WHERE ANO IN(%SYSEVALF(&anoFim.-3):&anofim.) AND CodTipo in ('0101' , '0102') AND Codigo_da_Situacao in (1, 6, 116, 117);
+BY IdAgente ANO Mes;
+RUN;
+
+
+%do Ano = %SYSEVALF(&anoFim.-3) %to &anofim;
+	%if &Ano = &anofim %then
+		%do;
+			%do Mes = 1 %to &mesfim;
+
+PROC SQL;
+	INSERT INTO QA 
+		SELECT DISTINCT t1.IdAgente, &Ano as Ano, &Mes as Mes, Numerador/Denominador AS QA
+			FROM (SELECT IdAgente, SUM(Qtde) AS Numerador FROM SMA_Solicitacoes_sorted
+						WHERE Ano*12+Mes IN (%SYSEVALF(&Ano*12+&Mes-13):%SYSEVALF(&Ano*12+&Mes-2)) /* filtra os 12 meses anteriores ao período de análise (2 meses antes da data de referência) */
+						AND CodTipo in ('0101' , '0102') AND Codigo_da_Situacao in (116, 1) /* ligações de informação e reclamação no SGO */
+						GROUP BY IdAgente) t1
+			LEFT JOIN
+			(SELECT IdAgente, SUM(Qtde) AS Denominador FROM SMA_Solicitacoes_sorted 
+						WHERE Ano*12+Mes IN (%SYSEVALF(&Ano*12+&Mes-13):%SYSEVALF(&Ano*12+&Mes-2)) /* filtra os 12 meses anteriores ao período de análise (2 meses antes da data de referência) */
+						AND codigo_da_situacao in (1, 116, 117, 6) AND CodTipo in ('0101' , '0102') /* ligações totais no SGO */
+						GROUP BY IdAgente) t2
+			ON t1.IdAgente = t2.IdAgente;
+QUIT;
+
+
+				%end;
+			%end;
+		%else
+			%do;
+				%do Mes = 1 %to 12;
+
+PROC SQL;
+	INSERT INTO QA 
+		SELECT DISTINCT t1.IdAgente, &Ano as Ano, &Mes as Mes, Numerador/Denominador AS QA
+			FROM (SELECT IdAgente, SUM(Qtde) AS Numerador FROM SMA_SAS.dw_SMA_Solicitacoes_01
+						WHERE Ano*12+Mes IN (%SYSEVALF(&Ano*12+&Mes-13):%SYSEVALF(&Ano*12+&Mes-2)) /* filtra os 12 meses anteriores ao período de análise (2 meses antes da data de referência) */
+						AND CodTipo in ('0101' , '0102') AND Codigo_da_Situacao in (116, 1) /* ligações de informação e reclamação no SGO */
+						GROUP BY IdAgente) t1
+			LEFT JOIN
+			(SELECT IdAgente, SUM(Qtde) AS Denominador FROM SMA_SAS.dw_SMA_Solicitacoes_01
+						WHERE Ano*12+Mes IN (%SYSEVALF(&Ano*12+&Mes-13):%SYSEVALF(&Ano*12+&Mes-2)) /* filtra os 12 meses anteriores ao período de análise (2 meses antes da data de referência) */
+						AND codigo_da_situacao in (1, 116, 117, 6) AND CodTipo in ('0101' , '0102') /* ligações totais no SGO */
+						GROUP BY IdAgente) t2
+			ON t1.IdAgente = t2.IdAgente;
+QUIT;
+
+			%end;
+			%end;
+	%end;
+%mend agendaJM;
+
+%agendaJM();
+
+PROC SQL;
+   CREATE TABLE WORK.QUALIDADE_ATENDIEMNTO AS 
+   SELECT t1.IdAgente, 
+   		  t2.ClassifAgente,
+          t1.Ano, 
+          t1.Mes, 
+		  INTNX('MONTH', MDY(Mes,1,Ano),-1) format ddmmyy10. as DataRef_QA, 
+		  MDY(Mes,1,Ano)  format ddmmyy10. as DataPainel,
+          t1.QA*100 AS QA
+		  FROM WORK.QA t1
+ /*Agrupamento com a tabela de agente para separar concessinária e permissionária */
+ LEFT JOIN SMA_SAS.SMA01_IdAgente t2 ON (t1.IdAgente = t2.IdAgente_SMA)
+         WHERE  t2.ClassifAgente = 'Concessionária'
+		  ORDER BY MDY(Mes,1,Ano) ASC ;
+QUIT;
+
+
+PROC SQL;
+DROP TABLE SMA_Solicitacoes_sorted, QA;
+QUIT;
+
+					/* BUSCA OS DADOS DA BIIBLIOTECA DA IndQual*/
+libname INDDISTR "/opt/sas/sasdata/Aneel/Sistemas ANEEL/IndQual";
+PROC SQL;
+   CREATE TABLE WORK.CNT AS 
+   SELECT t1.IdAgente, 
+          t1.SiglaPJ, 
+          t1.TipoAgente, 
+          t1.Regiao, 
+          t1.Ano, 
+          t1.Mes, 
+		  		  			/*Função para inserir a coluna data*/
+		  MDY(Mes,1,Ano)  format ddmmyy10. as Data, 
+		   			/*Os dados tem uma defasagem de 3 meses, essa função soma os 3 meses para gerar o período atual*/
+		  INTNX('MONTH', MDY(Mes,1,Ano) , 3) format ddmmyy10. as DataPainel,
+          t1.ICC, 
+          t1.DRPe, 
+          t1.DRCe, 
+          t1.DATULTATU
+      FROM INDDISTR.INDCONFMVLDIST t1
+	  WHERE t1.TipoAgente = 'C'
+	  ORDER BY MDY(Mes,1,Ano) ASC;
+QUIT;
+
+
+
+
+
+
+/*Proc Univariate Data=WORK.CTA noprint;
+BY Assunto DataRef_QR;
+VAR QR_Agrupado;
+Output Out= WORK.PERCENTISCTA PctlPre=QR PctlPts= 90 ;
+Run;
+
+PROC SQL;
+   CREATE TABLE WORK.PERCENTIS_FIXOS_CTA AS 
+   SELECT Assunto,
+          DataRef_QR,
+		  t1.QR90 AS PERCENTIL90,
+ 		  ROUND(QR90) AS PECENTIL90
+      FROM WORK.PERCENTISCTA t1
+      WHERE t1.DataRef_QR = '1Dec2019'd;
+QUIT;*/
+
+proc sql;
+   create table PERCENTIS_FIXOS_ASSUNTOS_CTA
+       (Assunto char(60),
+        Perc90 num);
+
+insert into PERCENTIS_FIXOS_ASSUNTOS_CTA
+    values('Alteração Cadastral',163)
+	values('Atendimento',1777)
+    values('Cobranças por Irregularidade',1408)
+    values('Faturamento',16293)
+	/*values('Prazos',3103)*/
+	values('Ressarcimento de Danos Elétricos',3370)
+	values('Tensão de Fornecimento',6308);
+ run;
+
+
+/*Proc Univariate Data=WORK.SGO noprint;
+BY Assunto DataRef_QRT;
+VAR QRT_Agrupado;
+Output Out= WORK.PERCENTISSGO PctlPre=QRT PctlPts= 90 ;
+Run;
+
+PROC SQL;
+   CREATE TABLE WORK.PERCENTIS_FIXOS_SGO AS 
+   SELECT Assunto,
+          DataRef_QRT,
+		  t1.QRT90 AS PERCENTIL90,
+ 		  ROUND(QRT90) AS PECENTIL90
+      FROM WORK.PERCENTISSGO t1
+      WHERE t1.DataRef_QRT = '1Dec2019'd;
+QUIT;
+*/
+
+proc sql;
+   create table PERCENTIS_FIXOS_ASSUNTOS_SGO
+       (Assunto char(60),
+        Perc90 num);
+
+insert into PERCENTIS_FIXOS_ASSUNTOS_SGO
+    values('Alteração Cadastral',1)
+	values('Atendimento',1)
+    values('Cobranças por Irregularidade',1)
+    values('Faturamento',7)
+	values('Geração Distribuída',0)
+	/*values('Prazos',4)*/
+	values('Ressarcimento de Danos Elétricos',2)
+	/*values('Suspensão Indevida',1)*/
+	values('Tensão de Fornecimento',2);
+ run;
+
+Proc Univariate Data=SGO noprint;
+        WHERE Assunto = 'Geração Distribuída';
+        BY DataRef_QRT;
+	    VAR QRT_Agrupado; 
+  Output Out=PERCENTIS_FIXOS_GD PctlPre=Percgd PctlPts=90; 
+Run;
+
+/*Proc Univariate Data=WORK.CONTINUIDADE_QPC noprint;
+BY DataRef_Cont;
+VAR QPC_relativo_RaizN;
+Output Out= WORK.PERCENTIS PctlPre=QPC_relativo_RaizN PctlPts= 90 ;
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.PERCENTIS_FIXOS AS 
+   SELECT
+		  t1.QPC_relativo_RaizN90 AS QPC_relativo_RaizN90,
+ 		  ROUND(QPC_relativo_RaizN90,0.01) AS NOTA0_QPC_relativo_RaizN90
+      FROM WORK.PERCENTIS t1
+      WHERE t1.DataRef_Cont = '1Dec2019'd;
+QUIT;
+*/
+proc sql;
+   create table PERCENTIL_FIXO_CONTINUIDADE
+       (Perc90_Continuidade num);
+
+insert into PERCENTIL_FIXO_CONTINUIDADE
+    values(590);
+ run;
+*/
+PROC SQL;
+ */
+DROP TABLE WORK.PERCENTIS_FIXOS, WORK.PERCENTIS;
+ */
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'CTA_Alteração Cadastral'n AS 
+   SELECT t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QR, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Assunto, 
+		  t1.QR_Agrupado FORMAT COMMAX8.2 AS 'QR Alteração Cadastral'n ,
+		  t2.Perc90,
+		  CASE  
+		  WHEN t1.QR_Agrupado > t2.Perc90 THEN 0
+		  ELSE 10-(t1.QR_Agrupado)/(t2.Perc90)*10 
+		  END AS 'Nota Alteração Cadastral CTA'n FORMAT COMMAX8.2
+ FROM  WORK.PERCENTIS_FIXOS_ASSUNTOS_CTA t2, WORK.CTA t1
+ WHERE  t1.Assunto = t2.Assunto AND t1.Assunto = 'Alteração Cadastral' 
+ ORDER BY t1.IdAgente ASC, t1.Assunto ASC, t1.DataRef_QR ASC;
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'SGO_Alteração_Cadastral'n AS 
+   SELECT t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QRT, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Assunto, 
+		  t1.QRT_Agrupado FORMAT COMMAX8.2 AS 'QRT Alteração Cadastral'n,
+		  t2.Perc90,
+		   CASE  
+				WHEN t1.QRT_Agrupado = 0 THEN 10
+				WHEN t1.QRT_Agrupado > t2.Perc90 THEN 0
+		  		ELSE 10-(t1.QRT_Agrupado)/(t2.Perc90)*10 
+		   END AS  'Nota Alteração Cadastral SGO'n FORMAT COMMAX8.2
+ FROM  WORK.PERCENTIS_FIXOS_ASSUNTOS_SGO t2, WORK.SGO t1
+ WHERE t1.Assunto = t2.Assunto AND t1.Assunto = 'Alteração Cadastral' 
+ ORDER BY t1.IdAgente ASC, t1.Assunto ASC, t1.DataRef_QRT ASC;
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'CTA_Atendimento'n AS 
+   SELECT t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QR, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Assunto, 
+		  t1.QR_Agrupado FORMAT COMMAX8.2 AS 'QR Atendimento'n,
+		  t2.Perc90,
+		  CASE  
+		  WHEN t1.QR_Agrupado > t2.Perc90 THEN 0
+		  ELSE 10-(t1.QR_Agrupado)/(t2.Perc90)*10 
+		  END AS 'Nota Atendimento CTA'n FORMAT COMMAX8.2 
+ FROM  WORK.PERCENTIS_FIXOS_ASSUNTOS_CTA t2, WORK.CTA t1
+ WHERE  t1.Assunto = t2.Assunto AND t1.Assunto = 'Atendimento' 
+ ORDER BY t1.IdAgente ASC, t1.Assunto ASC, t1.DataRef_QR ASC;
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'SGO_Atendimento'n AS 
+   SELECT t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QRT, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Assunto, 
+		  t1.QRT_Agrupado FORMAT COMMAX8.2 AS 'QRT Atendimento'n,
+		  t2.Perc90,
+		  CASE  
+				WHEN t1.QRT_Agrupado = 0 THEN 10
+				WHEN t1.QRT_Agrupado > t2.Perc90 THEN 0
+		  		ELSE 10-(t1.QRT_Agrupado)/(t2.Perc90)*10
+		   END AS  'Nota Atendimento SGO'n FORMAT COMMAX8.2
+ FROM  WORK.PERCENTIS_FIXOS_ASSUNTOS_SGO t2, WORK.SGO t1
+ WHERE t1.Assunto = t2.Assunto AND t1.Assunto = 'Atendimento'
+ ORDER BY t1.IdAgente ASC, t1.Assunto ASC, t1.DataRef_QRT ASC;
+QUIT;
+
+
+
+PROC SQL;
+   CREATE TABLE WORK.'QUALIDADE DO ATENDIMENTO'n AS 
+   SELECT t1.IdAgente, 
+          t1.Ano, 
+          t1.Mes,
+          t1.DataRef_QA, 
+          t1.DataPainel, 
+          t1.QA FORMAT COMMAX8.2,
+		  CASE   
+		  	    WHEN t1.QA BETWEEN 0 AND 70 THEN 10 
+		      /*WHEN t1.QA BETWEEN 100 AND 70 THEN 0 */
+		  	   ELSE ROUND((((10*t1.QA-1000)/(-30))),0.01)
+		  END 
+ 		       AS 'NOTA QA'n FORMAT COMMAX8.2
+
+      FROM WORK.QUALIDADE_ATENDIEMNTO t1;
+QUIT;
+
+
+PROC SQL;
+   CREATE TABLE WORK.'CTA_Cobranças_Irregularidade'n AS 
+   SELECT t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QR, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Assunto, 
+		  t1.QR_Agrupado FORMAT COMMAX8.2 AS 'QR Cobr. Irregularidade'n,
+		  t2.Perc90,
+		  CASE  
+		  WHEN t1.QR_Agrupado > t2.Perc90 THEN 0
+		  ELSE 10-(t1.QR_Agrupado)/(t2.Perc90)*10 
+		  END AS 'Nota Cobr. Irregularidade CTA'n FORMAT COMMAX8.2
+ FROM  WORK.PERCENTIS_FIXOS_ASSUNTOS_CTA t2, WORK.CTA t1
+ WHERE  t1.Assunto = t2.Assunto AND t1.Assunto = 'Cobranças por Irregularidade' 
+ ORDER BY t1.IdAgente ASC, t1.Assunto ASC, t1.DataRef_QR ASC;
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'SGO_Cobranças_Irregularidade'n AS 
+   SELECT t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QRT, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Assunto, 
+		  t1.QRT_Agrupado FORMAT COMMAX8.2 AS  'QRT Cobr. Irregularidade'n,
+		  t2.Perc90, 
+		  CASE  
+				WHEN t1.QRT_Agrupado = 0 THEN 10
+				WHEN t1.QRT_Agrupado > t2.Perc90 THEN 0
+		  		ELSE 10-(t1.QRT_Agrupado)/(t2.Perc90)*10 
+		   END AS  'Nota Cobr. Irregularidade SGO'n FORMAT COMMAX8.2
+ FROM  WORK.PERCENTIS_FIXOS_ASSUNTOS_SGO t2, WORK.SGO t1
+ WHERE t1.Assunto = t2.Assunto AND t1.Assunto = 'Cobranças por Irregularidade' 
+ ORDER BY t1.IdAgente ASC, t1.Assunto ASC, t1.DataRef_QRT ASC;
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'CTA_Faturamento'n AS 
+   SELECT t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QR, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Assunto, 
+		  t1.QR_Agrupado FORMAT COMMAX8.2 AS 'QR Faturamento'n,
+		  t2.Perc90,
+		  CASE  
+		  WHEN t1.QR_Agrupado > t2.Perc90 THEN 0
+		  ELSE 10-(t1.QR_Agrupado)/(t2.Perc90)*10 
+		  END AS 'Nota Faturamento CTA'n FORMAT COMMAX8.2
+ FROM  WORK.PERCENTIS_FIXOS_ASSUNTOS_CTA t2, WORK.CTA t1
+ WHERE  t1.Assunto = t2.Assunto AND t1.Assunto = 'Faturamento' 
+ ORDER BY t1.IdAgente ASC, t1.Assunto ASC, t1.DataRef_QR ASC;
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'SGO_Faturamento'n AS 
+   SELECT t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QRT, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Assunto, 
+		  t1.QRT_Agrupado  FORMAT COMMAX8.2 AS 'QRT Faturamento'n,
+		  t2.Perc90,
+		  CASE  
+				WHEN t1.QRT_Agrupado = 0 THEN 10
+				WHEN t1.QRT_Agrupado > t2.Perc90 THEN 0
+		  		ELSE 10-(t1.QRT_Agrupado)/(t2.Perc90)*10 
+		   END AS  'Nota Faturamento SGO'n FORMAT COMMAX8.2
+ FROM  WORK.PERCENTIS_FIXOS_ASSUNTOS_SGO t2, WORK.SGO t1
+ WHERE t1.Assunto = t2.Assunto AND t1.Assunto = 'Faturamento'
+ ORDER BY t1.IdAgente ASC, t1.Assunto ASC, t1.DataRef_QRT ASC;
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'CTA_Danos_Elétricos'n AS 
+   SELECT t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QR, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Assunto, 
+		  t1.QR_Agrupado FORMAT COMMAX8.2 AS 'QR Danos Elétricos'n,
+		  t2.Perc90,
+		  CASE  
+		  WHEN t1.QR_Agrupado > t2.Perc90 THEN 0
+		  ELSE 10-(t1.QR_Agrupado)/(t2.Perc90)*10 
+		  END AS 'Nota Danos Elétricos CTA'n FORMAT COMMAX8.2
+ FROM  WORK.PERCENTIS_FIXOS_ASSUNTOS_CTA t2, WORK.CTA t1
+ WHERE  t1.Assunto = t2.Assunto AND t1.Assunto = 'Ressarcimento de Danos Elétricos' 
+ ORDER BY t1.IdAgente ASC, t1.Assunto ASC, t1.DataRef_QR ASC;
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'SGO_Danos_Elétricos'n AS 
+   SELECT t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QRT, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Assunto, 
+		  t1.QRT_Agrupado FORMAT COMMAX8.2 AS 'QRT Danos Elétricos'n,
+		  t2.Perc90,
+		  CASE  
+				WHEN t1.QRT_Agrupado = 0 THEN 10
+				WHEN t1.QRT_Agrupado > t2.Perc90 THEN 0
+		  		ELSE 10-(t1.QRT_Agrupado)/(t2.Perc90)*10
+		   END AS  'Nota Danos Elétricos SGO'n FORMAT COMMAX8.2
+ FROM  WORK.PERCENTIS_FIXOS_ASSUNTOS_SGO t2, WORK.SGO t1
+ WHERE t1.Assunto = t2.Assunto AND t1.Assunto = 'Ressarcimento de Danos Elétricos' 
+ ORDER BY t1.IdAgente ASC, t1.Assunto ASC, t1.DataRef_QRT ASC;
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'CTA_TensãO_Fornecimento'n AS 
+   SELECT t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QR, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Assunto, 
+		  t1.QR_Agrupado FORMAT COMMAX8.2 AS 'QR Tensão de Fornecimento'n,
+		  t2.Perc90,
+		  CASE  
+		  WHEN t1.QR_Agrupado > t2.Perc90 THEN 0
+		  ELSE 10-(t1.QR_Agrupado)/(t2.Perc90)*10 
+		  END AS 'Nota Tensão de Fornecimento CTA'n FORMAT COMMAX8.2
+ FROM  WORK.PERCENTIS_FIXOS_ASSUNTOS_CTA t2, WORK.CTA t1
+ WHERE  t1.Assunto = t2.Assunto AND t1.Assunto = 'Tensão de Fornecimento' 
+ ORDER BY t1.IdAgente ASC, t1.Assunto ASC, t1.DataRef_QR ASC;
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'SGO_TensãO_Fornecimento'n AS 
+   SELECT t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QRT, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Assunto, 
+		  t1.QRT_Agrupado FORMAT COMMAX8.2 AS 'QRT Tensão de Fornecimento'n ,
+		  t2.Perc90,
+		  CASE  
+				WHEN t1.QRT_Agrupado = 0 THEN 10
+				WHEN t1.QRT_Agrupado > t2.Perc90 THEN 0
+		  		ELSE 10-(t1.QRT_Agrupado)/(t2.Perc90)*10 
+		   END AS  'Nota Tensão de Fornecimento SGO'n FORMAT COMMAX8.2
+ FROM  WORK.PERCENTIS_FIXOS_ASSUNTOS_SGO t2, WORK.SGO t1
+ WHERE t1.Assunto = t2.Assunto AND t1.Assunto = 'Tensão de Fornecimento' 
+ ORDER BY t1.IdAgente ASC, t1.Assunto ASC, t1.DataRef_QRT ASC;
+QUIT;
+
+
+PROC SQL;
+   CREATE TABLE WORK.'ICC_TensãO_Fornecimento'n AS 
+   SELECT t1.IdAgente, 
+          t1.SiglaPJ, 
+          t1.TipoAgente, 
+          t1.Regiao, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Data, 
+          t1.DataPainel, 
+          t1.ICC FORMAT COMMAX8.2,  
+		  CASE   
+		  	    WHEN t1.ICC = 0 THEN 10 
+				WHEN t1.ICC > 20 THEN 0
+		  	   ELSE ROUND(((-0.5*t1.ICC) + 10),0.01)
+		  END AS  'Nota Tensão de Fornecimento ICC'n FORMAT COMMAX8.2
+
+      FROM WORK.CNT t1;
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'DRPe_TensãO_Fornecimento'n AS 
+   SELECT t1.IdAgente, 
+          t1.SiglaPJ, 
+          t1.TipoAgente, 
+          t1.Regiao, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Data, 
+          t1.DataPainel,
+          t1.DRPe FORMAT COMMAX8.2, 
+          CASE   
+		  	    WHEN t1.DRPe = 0 THEN 10 
+				WHEN t1.DRPe > 4 THEN 0
+		  	   ELSE ROUND((((-10*t1.DRPe+40)/(4))),0.01)
+		  END AS  'Nota Tensão de Fornecimento DRPe'n FORMAT COMMAX8.2
+      FROM WORK.CNT t1;
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'DRCe_TensãO_Fornecimento'n AS 
+   SELECT t1.IdAgente, 
+          t1.SiglaPJ, 
+          t1.TipoAgente, 
+          t1.Regiao, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Data, 
+          t1.DataPainel,
+          t1.DRCe FORMAT COMMAX8.2,  
+         CASE   
+		  	    WHEN t1.DRPe = 0 THEN 10 
+				WHEN t1.DRPe > 3 THEN 0
+		  	   ELSE ROUND((((-10*t1.DRPe+30)/(3))),0.01)
+		  END AS  'Nota Tensão de Fornecimento DRCe'n FORMAT COMMAX8.2
+      FROM WORK.CNT t1;
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.'GERAÇÃO DISTRIBUÍDA'n AS 
+   SELECT t1.IdAgente, 
+          t1.Sigla, 
+          t1.DataRef_QRT, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes, 
+          t1.Assunto, 
+		  t1.QRT_Agrupado FORMAT COMMAX8.2 AS 'QRT Geração Distribuída'n ,
+		  t2.Percgd90,
+		  CASE  
+				WHEN t1.QRT_Agrupado = 0 THEN 10
+				WHEN t1.QRT_Agrupado > t2.Percgd90  THEN 0
+			    ELSE 10-(t1.QRT_Agrupado)/(t2.Percgd90)*10 
+		   END AS 'Nota Geração Distribuída'n FORMAT COMMAX8.2
+ FROM WORK.PERCENTIS_FIXOS_GD t2, WORK.SGO t1
+ WHERE t1.DataRef_QRT = t2.DataRef_QRT AND t1.Assunto = 'Geração Distribuída'
+ ORDER BY t1.IdAgente ASC, t1.Assunto ASC, t1.DataRef_QRT ASC;
+
+
+PROC SQL;
+   CREATE TABLE WORK.'RELIGAÇÃO'n AS 
+   SELECT t1.SiglaAgente, 
+          t1.IdAgente,  
+          t1.DataRef_Ser_Com, 
+		  t1.DataPainel,
+          t1.Mes,
+		  t1.Ano,  
+          /*t1.QtdeServCom, 
+          /*t1.QuantServComPrazo, */
+          t1.QuantViolServCom, 
+          t1.Perc_Serv_Com_Prazo  FORMAT COMMAX8.2 AS 'Percentual Religação'n, 
+/*Realiza o cauculo da nota levendo em consideração o percentual, caso seja 100% a nota será 10 e apartir de 75% a nota será 0 */  
+		  CASE   
+		  	   WHEN t1.QuantViolServCom = 0 THEN 10
+		       WHEN t1.Perc_Serv_Com_Prazo NOT BETWEEN 100 AND 75 THEN 0
+		  	   ELSE ROUND(0.4*(t1.Perc_Serv_Com_Prazo-75),0.01)
+		  END 
+ 		       AS 'Nota Religação'n  FORMAT COMMAX8.2,
+
+          t1.IdGrupoServ as Assunto
+      FROM  WORK.'SERVIÇOS_COMERCIAIS'n t1
+      WHERE t1.IdGrupoServ = 'Religação';
+QUIT;
+
+PROC SQL;
+   CREATE TABLE WORK.CONTINUIDADE AS 
+   SELECT t1.IdAgente, 
+          t1.SiglaPJ,
+          t1.DataRef_Cont,
+          t1.DataPainel,
+          t1.Mes,
+		  t1.Ano,  
+          /*t1.N, 
+          /*t1.QPC_DEC, 
+          t1.QPC_FEC, */
+          t1.QPC FORMAT COMMAX8.2,
+		  t2.Perc90_Continuidade,
+          t1.QPC_relativo_RaizN FORMAT COMMAX8.2,
+		  CASE  
+		        WHEN t1.QPC_relativo_RaizN > t2.Perc90_Continuidade THEN 0
+				WHEN t1.QPC_relativo_RaizN = 0 THEN 10
+		  		ELSE ROUND(10-(t1.QPC_relativo_RaizN)/(t2.Perc90_Continuidade)*10 ,0.01)
+		   END AS 'Nota Continuidade'n FORMAT COMMAX8.2
+      FROM WORK.CONTINUIDADE_QPC t1,PERCENTIL_FIXO_CONTINUIDADE t2
+	  WHERE t1.Ano > 2015;
+QUIT;
+
+
+PROC SQL;
+   CREATE TABLE WORK.'LIGAÇÃO SEM OBRA'n AS 
+   SELECT t1.SiglaAgente, 
+          t1.IdAgente, 
+          t1.DataRef_Ser_Com, 
+		  t1.DataPainel,
+          t1.Mes,
+		  t1.Ano, 
+          /*t1.QtdeServCom, 
+          t1.QuantServComPrazo, */
+          t1.QuantViolServCom,
+          t1.Perc_Serv_Com_Prazo  FORMAT COMMAX8.2 AS 'Percentual ligação sem obra'n,
+/*Realiza o cauculo da nota levendo em consideração o percentual, caso seja 100% a nota será 10 e apartir de 75% a nota será 0 */  
+		  CASE  
+		  	   WHEN t1.QuantViolServCom = 0 THEN 10
+		       WHEN t1.Perc_Serv_Com_Prazo NOT BETWEEN 100 AND 75 THEN 0
+		  	   ELSE ROUND(0.4*(t1.Perc_Serv_Com_Prazo-75),0.01)
+		  END 
+ 		       AS 'Nota ligação sem obra'n  FORMAT COMMAX8.2,
+
+          t1.IdGrupoServ AS Assunto
+      FROM  WORK.'SERVIÇOS_COMERCIAIS'n t1
+      WHERE t1.IdGrupoServ = 'Pedidos de ligação nova sem obra';
+QUIT;
+
+
+PROC SQL;
+   CREATE TABLE WORK.'LIGAÇÃO_NOVA_COM_OBRA'n AS 
+   SELECT t1.SiglaAgente, 
+          t1.IdAgente, 
+          t1.DataRef_Ser_Com,
+          t1.DataPainel,
+          t1.Mes,
+		  t1.Ano,  
+          /*t1.QtdeServCom, 
+          t1.QuantServComPrazo, */
+          t1.QuantViolServCom, 
+          t1.Perc_Serv_Com_Prazo FORMAT COMMAX8.2 AS 'Percentual ligação com obra'n, 
+/*Realiza o cauculo da nota levendo em consideração o percentual, caso seja 100% a nota será 10 e apartir de 75% a nota será 0 */  
+		  CASE   
+			   WHEN t1.QuantViolServCom = 0 THEN 10
+		       WHEN t1.Perc_Serv_Com_Prazo NOT BETWEEN 100 AND 75 THEN 0
+		  	   ELSE ROUND(0.4*(t1.Perc_Serv_Com_Prazo-75),0.01)
+		  END 
+ 		       AS 'Nota ligação nova com obra'n FORMAT COMMAX8.2,
+
+          t1.IdGrupoServ AS Assunto
+      FROM  WORK.'SERVIÇOS_COMERCIAIS'n t1
+      WHERE  t1.IdGrupoServ = 'Pedidos de ligação nova com obra';
+QUIT;
+
+
+
+PROC SQL;
+   CREATE TABLE WORK.'ESTOQUE DE LIGAÇÃO'n AS 
+   SELECT 
+          t1.IdAgente, 
+          t1.SiglaAgente, 
+          t1.Ano, 
+          t1.QtdNaoIniciada, 
+          t1.QtdEmAndamento, 
+          t1.QtdAtrasada, 
+          t1.QtdTotal AS 'Estoque de ligação'n, 
+/*Realiza o cauculo da nota levendo em consideração o percentual, caso seja 100% a nota será 10 e apartir de 75% a nota será 0 */  
+		  CASE  
+ 
+		  	   WHEN  t1.QtdTotal = 0 THEN 10
+			   WHEN  t1.QtdTotal >= 1000 THEN 0
+		  	   ELSE ROUND((10-(t1.QtdTotal)/(1000)*10 ),0.01)
+		  END 
+ 		       AS 'Nota Estoque de ligação'n FORMAT COMMAX8.2 
+      FROM WORK.'ESTOQUE_DE_LIGAÇÕES_ATRASADAS'n t1;
+QUIT;
+
+
+
+PROC SQL;
+   CREATE TABLE SFEMONIT.SFE_RANK_DISTRI_PONDERADO AS 
+   SELECT Distinct t1.IdAgente, 
+          t1.SiglaAgente,
+		  t1.Grupo,
+	      t1.Personificacao,
+	      t1.Agencia,
+		  t1.UC, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes,
+                t2.'Nota Alteração Cadastral'n FORMAT COMMAX8.2 AS 'Alteracao_Cadastral'n, 
+		 4.70 * t2.'Nota Alteração Cadastral'n FORMAT COMMAX8.2 AS 'Ponderado_Alteracao_Cadastral'n, 
+		 4.70 * (10 - t2.'Nota Alteração Cadastral'n) FORMAT COMMAX8.2 AS 'Margem_Alteracao_Cadastral'n, 
+                t3.'Nota Atendimento'n FORMAT COMMAX8.2 AS 'Atendimento'n, 
+		 6.40 * t3.'Nota Atendimento'n FORMAT COMMAX8.2 AS 'Ponderado_Atendimento'n, 
+		 6.40 * (10-t3.'Nota Atendimento'n) FORMAT COMMAX8.2 AS 'Margem_Atendimento'n, 
+		        t4.'Nota Cobrança por Irregularidade'n FORMAT COMMAX8.2 AS 'Cobranca_Irregularida'n,
+         5.30 * t4.'Nota Cobrança por Irregularidade'n FORMAT COMMAX8.2 AS 'Ponderado_Cobranca_Irregularida'n,
+         5.30 * (10-t4.'Nota Cobrança por Irregularidade'n) FORMAT COMMAX8.2 AS 'Margem_Cobranca_Irregularida'n,
+		        t5.'Nota Faturamento'n  FORMAT COMMAX8.2 AS 'Faturamento'n, 
+         6.60 * t5.'Nota Faturamento'n  FORMAT COMMAX8.2 AS 'Ponderado_Faturamento'n, 
+         6.60 * (10-t5.'Nota Faturamento'n)  FORMAT COMMAX8.2 AS 'Margem_Faturamento'n, 
+                t6.'Nota Danos Elétricos'n  FORMAT COMMAX8.2 AS 'Danos_Eletricos'n,
+		 5.50 * t6.'Nota Danos Elétricos'n  FORMAT COMMAX8.2 AS 'Ponderado_Danos_Eletricos'n,
+		 5.50 * (10-t6.'Nota Danos Elétricos'n)  FORMAT COMMAX8.2 AS 'Margem_Danos_Eletricos'n,
+		        t7.'Nota Geração Distribuída'n  FORMAT COMMAX8.2 AS 'Geracao_Distribuida'n, 
+		 5.10 * t7.'Nota Geração Distribuída'n  FORMAT COMMAX8.2 AS 'Ponderado_Geracao_Distribuida'n, 
+		 5.10 * (10-t7.'Nota Geração Distribuída'n)  FORMAT COMMAX8.2 AS 'Margem_Geracao_Distribuida'n, 
+		        t8.'Nota Tensão de Fornecimento'n FORMAT COMMAX8.2 AS 'CNT'n,
+         6.10 * t8.'Nota Tensão de Fornecimento'n FORMAT COMMAX8.2 AS 'Ponderado_CNT'n,
+         6.10 * (10-t8.'Nota Tensão de Fornecimento'n) FORMAT COMMAX8.2 AS 'Margem_CNT'n,
+                t9.'Nota Religação'n FORMAT COMMAX8.2 AS 'Religacao'n, 
+         6.60 * t9.'Nota Religação'n FORMAT COMMAX8.2 AS 'Ponderado_Religacao'n,
+         6.60 * (10-t9.'Nota Religação'n) FORMAT COMMAX8.2 AS 'Margem_Religacao'n,
+		        t11.'Nota ligação com obra'n FORMAT COMMAX8.2 AS 'Ligacao_com_obra'n,
+         6.90 * t11.'Nota ligação com obra'n FORMAT COMMAX8.2 AS 'Ponderado_Ligacao_com_obra'n,
+         6.90 * (10-t11.'Nota ligação com obra'n) FORMAT COMMAX8.2 AS 'Margem_Ligacao_com_obra'n,
+                t12.'Nota ligação sem obra'n FORMAT COMMAX8.2 AS 'Ligacao_sem_obra'n, 
+         6.80 * t12.'Nota ligação sem obra'n FORMAT COMMAX8.2 AS 'Ponderado_Ligacao_sem_obra'n,
+         6.80 * (10-t12.'Nota ligação sem obra'n) FORMAT COMMAX8.2 AS 'Margem_Ligacao_sem_obra'n,
+		        t10.'Nota Continuidade'n FORMAT COMMAX8.2 AS 'Continuidade'n, 
+         40   * t10.'Nota Continuidade'n FORMAT COMMAX8.2 AS 'Ponderado_Continuidade'n, 
+         40   * (10-t10.'Nota Continuidade'n) FORMAT COMMAX8.2 AS 'Margem_Continuidade'n, 
+		 /* Nota final da empresa */
+            (SUM( 4.70 * t2.'Nota Alteração Cadastral'n, 
+         6.40 * t3.'Nota Atendimento'n, 
+         5.30 * t4.'Nota Cobrança por Irregularidade'n, 
+         6.60 * t5.'Nota Faturamento'n, 
+         5.50 * t6.'Nota Danos Elétricos'n,
+		 5.10 * t7.'Nota Geração Distribuída'n, 
+         6.10 * t8.'Nota Tensão de Fornecimento'n, 
+         6.60 * t9.'Nota Religação'n,
+         40   * t10.'Nota Continuidade'n, 
+         6.90 * t11.'Nota ligação com obra'n, 
+         6.80 * t12.'Nota ligação sem obra'n))/100 FORMAT COMMAX8.2 AS Nota_Empresa,
+		  datetime() format = datetime. as DATULTATU
+
+	FROM Agentes t1
+LEFT JOIN WORK.'ALTERAÇÃO CADASTRAL'n t2                   		                ON (t1.IdAgente = t2.IdAgente) AND (t1.DataPainel = t2.DataPainel)
+LEFT JOIN WORK.ATENDIMENTO t3		   					                        ON (t1.IdAgente = t3.IdAgente) AND (t1.DataPainel = t3.DataPainel)
+LEFT JOIN WORK.'COBRANÇAS POR IRREGULARIDADE'n t4					   			ON (t1.IdAgente = t4.IdAgente) AND (t1.DataPainel = t4.DataPainel)
+LEFT JOIN WORK.FATURAMENTO t5													ON (t1.IdAgente = t5.IdAgente) AND (t1.DataPainel = t5.DataPainel)
+LEFT JOIN WORK.'DANOS ELÉTRICOS'n t6					 						ON (t1.IdAgente = t6.IdAgente) AND (t1.DataPainel = t6.DataPainel)
+LEFT JOIN WORK.'GERAÇÃO DISTRIBUÍDA'n t7				    					ON (t1.IdAgente = t7.IdAgente) AND (t1.DataPainel = t7.DataPainel)
+LEFT JOIN WORK.'NÍVEL DE TENSÃO'n t8 	  										ON (t1.IdAgente = t8.IdAgente) AND (t1.DataPainel = t8.DataPainel)
+LEFT JOIN WORK.'RELIGAÇÃO'n t9 													ON (t1.IdAgente = t9.IdAgente) AND (t1.DataPainel = t9.DataPainel)
+LEFT JOIN WORK.CONTINUIDADE t10 												ON (t1.IdAgente = t10.IdAgente) AND (t1.DataPainel = t10.DataPainel)
+LEFT JOIN WORK.'LIGAÇÃO COM OBRA'n t11    										ON (t1.IdAgente = t11.IdAgente) AND (t1.DataPainel = t11.DataPainel)
+LEFT JOIN WORK.'LIGAÇÃO SEM OBRA'n t12 	            							ON (t1.IdAgente = t12.IdAgente) AND (t1.DataPainel = t12.DataPainel)
+GROUP BY t1.DataPainel
+ORDER BY t1.DataPainel,t1.IdAgente; 
+QUIT;
+/*
+proc rank data=WORK.SFE_RANK_DISTRI_PONDERADO out=results ties=low descending;
+   by DataPainel;
+   var Nota_Empresa;
+   ranks Nota_Rank;
+run;
+
+PROC SQL;
+   CREATE TABLE SFEMONIT.SFE_RANK_INDICADORES AS 
+   SELECT Distinct t1.IdAgente, 
+          t1.SiglaAgente,
+		  t1.Grupo,
+	      t1.Personificacao,
+	      t1.Agencia,
+		  t1.UC, 
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes,
+          t2.DataRef_QR AS 'DataRef_QR_Alt_Cad'n , 
+          t2.'QR Alteração Cadastral'n AS 'QR_Alteracao_Cadastral'n ,
+          t2.DataRef_QRT AS 'DataRef_QRT_Alt_Cad'n,
+          t2.'QRT Alteração Cadastral'n AS 'QRT_Alteracao_Cadastral'n ,
+          t3.DataRef_QR AS 'DataRef_QR_Atendimento'n, 
+          t3.'QR Atendimento'n AS 'QR_Atendimento'n ,
+	      t3.DataRef_QRT AS 'DataRef_QRT_Atendimento'n,
+          t3.'QRT Atendimento'n AS 'QRT_Atendimento'n ,
+		  t3.DataRef_QA AS 'DataRef_QA'n,
+          t3.QA AS QA ,
+          t4.DataRef_QR AS 'DataRef_QR_Cobr_Irreg'n, 
+          t4.'QR Cobr. Irregularidade'n AS 'QR_Cobr_Irregularidade'n ,
+          t4.DataRef_QRT AS 'DataRef_QRT_Cobr_Irreg'n,
+          t4.'QRT Cobr. Irregularidade'n AS 'QRT_Cobr_Irregularidade'n ,
+          t5.DataRef_QR AS 'DataRef_QR_Faturamento'n,
+          t5.'QR Faturamento'n AS 'QR_Faturamento'n , 
+		  t5.DataRef_QRT AS 'DataRef_QRT_Faturamento'n,
+          t5.'QRT Faturamento'n AS 'QRT_Faturamento'n ,
+          t6.DataRef_QR AS 'DataRef_QR_Danos_Eletricos'n,
+          t6.'QR Danos Elétricos'n AS 'QR_Danos_Eletricos'n ,
+		  t6.DataRef_QRT AS 'DataRef_QRT_Danos_Eletricos'n,
+          t6.'QRT Danos Elétricos'n AS 'QRT_Danos Eletricos'n ,
+          t7.DataRef_QRT AS 'DataRef_QRT_GD'n, 
+		  t7.'QRT Geração Distribuída'n AS 'QRT_Geracao_Distribuída'n,
+		  t8.DataRef_QR AS 'DataRef_QR_Tensao_Fornec'n,
+          t8.'QR Tensão de Fornecimento'n AS 'QR_Tensao_Fornecimento'n , 
+		  t8.DataRef_QRT AS 'DataRef_QRT_Tensao_Fornec'n,
+          t8.'QRT Tensão de Fornecimento'n AS 'QRT_Tensao_Fornecimento'n ,
+		  t9.DataRef_Ser_Com AS 'DataRef_Religacao'n,
+          t9.'Percentual Religação'n AS 'Percentual_Religacao'n ,
+          t11.DataRef_Ser_Com AS 'DataRef_ligacao_com_obra'n,
+		  t11.'Percentual ligação com obra'n AS 'Percentual_ligacao_com_obra'n ,
+		  t11.Ano AS 'AnoRef_Total_Estoque'n,
+ 		  t11.'Total estoque de ligação'n AS 'Total_estoque_ligacao'n ,
+          t11.DataRef_Ser_Com AS 'DataRef_ligacao_sem_obra'n,
+          t12.'Percentual ligação sem obra'n AS 'Percentual_ligacao_sem_obra'n,
+          t10.DataRef_Cont AS 'DataRef_Continuidade'n,
+          t10.QPC AS QPC, 
+          t10.QPC_relativo_RaizN AS QPC_relativo_RaizN,
+		  datetime() format = datetime. as DATULTATU
+
+	FROM Agentes t1
+LEFT JOIN WORK.'ALTERAÇÃO CADASTRAL'n t2                   		                ON (t1.IdAgente = t2.IdAgente) AND (t1.DataPainel = t2.DataPainel)
+LEFT JOIN WORK.ATENDIMENTO t3		   					                        ON (t1.IdAgente = t3.IdAgente) AND (t1.DataPainel = t3.DataPainel)
+LEFT JOIN WORK.'COBRANÇAS POR IRREGULARIDADE'n t4					   			ON (t1.IdAgente = t4.IdAgente) AND (t1.DataPainel = t4.DataPainel)
+LEFT JOIN WORK.FATURAMENTO t5													ON (t1.IdAgente = t5.IdAgente) AND (t1.DataPainel = t5.DataPainel)
+LEFT JOIN WORK.'DANOS ELÉTRICOS'n t6					 						ON (t1.IdAgente = t6.IdAgente) AND (t1.DataPainel = t6.DataPainel)
+LEFT JOIN WORK.'GERAÇÃO DISTRIBUÍDA'n t7				    					ON (t1.IdAgente = t7.IdAgente) AND (t1.DataPainel = t7.DataPainel)
+LEFT JOIN WORK.'NÍVEL DE TENSÃO'n t8 	  										ON (t1.IdAgente = t8.IdAgente) AND (t1.DataPainel = t8.DataPainel)
+LEFT JOIN WORK.'RELIGAÇÃO'n t9 													ON (t1.IdAgente = t9.IdAgente) AND (t1.DataPainel = t9.DataPainel)
+LEFT JOIN WORK.CONTINUIDADE t10 												ON (t1.IdAgente = t10.IdAgente) AND (t1.DataPainel = t10.DataPainel)
+LEFT JOIN WORK.'LIGAÇÃO COM OBRA'n t11    										ON (t1.IdAgente = t11.IdAgente) AND (t1.DataPainel = t11.DataPainel)
+LEFT JOIN WORK.'LIGAÇÃO SEM OBRA'n t12 	            							ON (t1.IdAgente = t12.IdAgente) AND (t1.DataPainel = t12.DataPainel)
+	ORDER BY t1.DataPainel,t1.IdAgente; 
+QUIT;
+
+PROC SQL;
+   CREATE TABLE SFEMONIT.SFE_RANK_NOTA AS 
+   SELECT Distinct t1.IdAgente, 
+          t1.SiglaAgente,
+          t1.Grupo,
+	      t1.Personificacao,
+	      t1.Agencia, 
+		  t1.UC,
+          t1.DataPainel, 
+          t1.Ano, 
+          t1.Mes,
+          t2.'Nota Alteração Cadastral CTA'n AS 'Nota_Alteracao_Cadastral_CTA'n , 
+          t2.'Nota Alteração Cadastral SGO'n AS 'Nota_Alteracao_Cadastral_SGO'n, 
+          t3.'Nota Atendimento CTA'n AS 'Nota_Atendimento_CTA'n, 
+          t3.'Nota Atendimento SGO'n AS 'Nota_Atendimento_SGO'n, 
+          t3.'NOTA QA'n AS 'NOTA_QA'n, 
+          t4.'Nota Cobr. Irregularidade CTA'n AS 'Nota_Cobr_Irregularidade_CTA'n, 
+          t4.'Nota Cobr. Irregularidade SGO'n AS 'Nota_Cobr_Irregularidade_SGO'n , 
+          t5.'Nota Faturamento CTA'n AS 'Nota_Faturamento_CTA'n, 
+          t5.'Nota Faturamento SGO'n AS 'Nota_Faturamento_SGO'n, 
+          t6.'Nota Danos Elétricos CTA'n AS 'Nota_Danos_Eletricos_CTA'n, 
+          t6.'Nota Danos Elétricos SGO'n AS 'Nota_Danos_Eletricos_SGO'n, 
+		  t7.'Nota Geração Distribuída'n AS 'Nota_Geracao_Distribuida'n,
+          t8.'Nota Tensão de Fornecimento CTA'n AS 'Nota_Tensao_Fornecimento_CTA'n, 
+          t8.'Nota Tensão de Fornecimento SGO'n AS 'Nota_Tensao_Fornecimento_SGO'n,
+         /* t8.'Nota Tensão de Fornecimento ICC'n AS 'Nota_Tensao_Fornecimento_ICC'n,
+		  t8.'Nota Tensão de Fornecimento DRPe'n AS 'Nota_Tensao_Fornecimento_DRPe'n,
+		  t8.'Nota Tensão de Fornecimento DRCe'n AS 'Nota_Tensao_Fornecimento_DRCe'n, 
+          t9.'Nota Religação'n AS 'Nota_Religacao'n,  *******Esse item não compõe a nota */
+		 
+          t10.'Nota Continuidade'n AS 'Nota_Continuidade'n, 
+          t12.'Nota ligação sem obra'n AS 'Nota_ligacao_sem_obra'n, 
+          t11.'Nota ligação nova com obra'n AS 'Nota_ligacao_nova_com_obra'n, 
+          t11.'Nota Estoque de ligação'n AS 'Nota_Estoque_de_ligacao'n,
+		  datetime() format = datetime. as DATULTATU
+
+	FROM Agentes t1
+LEFT JOIN WORK.'ALTERAÇÃO CADASTRAL'n t2                   		                ON (t1.IdAgente = t2.IdAgente) AND (t1.DataPainel = t2.DataPainel)
+LEFT JOIN WORK.ATENDIMENTO t3		   					                        ON (t1.IdAgente = t3.IdAgente) AND (t1.DataPainel = t3.DataPainel)
+LEFT JOIN WORK.'COBRANÇAS POR IRREGULARIDADE'n t4					   			ON (t1.IdAgente = t4.IdAgente) AND (t1.DataPainel = t4.DataPainel)
+LEFT JOIN WORK.FATURAMENTO t5													ON (t1.IdAgente = t5.IdAgente) AND (t1.DataPainel = t5.DataPainel)
+LEFT JOIN WORK.'DANOS ELÉTRICOS'n t6					 						ON (t1.IdAgente = t6.IdAgente) AND (t1.DataPainel = t6.DataPainel)
+LEFT JOIN WORK.'GERAÇÃO DISTRIBUÍDA'n t7				    					ON (t1.IdAgente = t7.IdAgente) AND (t1.DataPainel = t7.DataPainel)
+LEFT JOIN WORK.'NÍVEL DE TENSÃO'n t8 	  										ON (t1.IdAgente = t8.IdAgente) AND (t1.DataPainel = t8.DataPainel)
+LEFT JOIN WORK.'RELIGAÇÃO'n t9 													ON (t1.IdAgente = t9.IdAgente) AND (t1.DataPainel = t9.DataPainel)
+LEFT JOIN WORK.CONTINUIDADE t10 												ON (t1.IdAgente = t10.IdAgente) AND (t1.DataPainel = t10.DataPainel)
+LEFT JOIN WORK.'LIGAÇÃO COM OBRA'n t11    										ON (t1.IdAgente = t11.IdAgente) AND (t1.DataPainel = t11.DataPainel)
+LEFT JOIN WORK.'LIGAÇÃO SEM OBRA'n t12 	            							ON (t1.IdAgente = t12.IdAgente) AND (t1.DataPainel = t12.DataPainel)
+ORDER BY t1.DataPainel,t1.IdAgente; 
+QUIT;
+
+
